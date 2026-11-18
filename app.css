@@ -140,6 +140,15 @@ h1 { font-size: 24px; line-height: 1.25; letter-spacing: -0.01em; margin: 0; }
 .check { display: flex; gap: 10px; align-items: flex-start; padding: 6px 2px; cursor: pointer; }
 .check input { margin: 3px 0 0; width: 18px; height: 18px; flex: none; accent-color: var(--accent); }
 .hint { margin: 0; font-size: 13px; color: var(--muted); }
+.field-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; padding: 2px 2px 4px; }
+.field-row label { font-size: 14px; }
+select {
+  min-height: 40px; padding: 6px 10px; border: 1px solid var(--line); border-radius: 9px;
+  background: var(--surface); color: var(--ink); font-size: 15px; max-width: 100%;
+}
+#ocrGet { align-self: flex-start; }
+.btn.subtle { color: var(--muted); }
+.ocr-acts .btn { flex: 0 1 auto; }
 
 /* 결과 */
 .out-head { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; justify-content: space-between; }

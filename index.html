@@ -2,11 +2,11 @@
 <html lang="ko">
 <head>
 <meta charset="utf-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src 'self'; worker-src 'self'; manifest-src 'self'; object-src 'none'; frame-src 'none'; base-uri 'self'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' blob: 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src 'self'; worker-src 'self'; manifest-src 'self'; object-src 'none'; frame-src 'none'; base-uri 'self'; form-action 'none'">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="referrer" content="no-referrer">
 <title>PDF → TXT 변환</title>
-<meta name="description" content="PDF 안의 글자를 꺼내 TXT 파일로 저장하는 앱. PDF는 기기 밖으로 나가지 않고, AI를 쓰지 않습니다.">
+<meta name="description" content="PDF 안의 글자를 꺼내 TXT 파일로 저장하는 앱. 스캔한 PDF는 기기 안에서 문자인식(OCR)으로 읽습니다. PDF는 기기 밖으로 나가지 않습니다.">
 <meta name="theme-color" content="#2b5797">
 <meta name="app-build" content="2026.11.18">
 <meta name="mobile-web-app-capable" content="yes">
@@ -23,10 +23,10 @@
   <header class="top">
     <div>
       <h1>PDF → TXT</h1>
-      <p class="lede">PDF 안에 들어 있는 글자를 꺼내 텍스트(.txt) 파일로 저장합니다.</p>
+      <p class="lede">PDF 안에 들어 있는 글자를 꺼내 텍스트(.txt) 파일로 저장합니다. 스캔한 PDF는 문자인식(OCR)으로 읽습니다.</p>
     </div>
     <div class="privacy-box">
-      <p class="privacy"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="11" width="14" height="9" rx="2" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M8 11V8a4 4 0 0 1 8 0v3" fill="none" stroke="currentColor" stroke-width="1.8"/></svg>PDF는 이 기기 안에서만 읽고 어디로도 보내지 않습니다. AI를 쓰지 않습니다.</p>
+      <p class="privacy"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="11" width="14" height="9" rx="2" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M8 11V8a4 4 0 0 1 8 0v3" fill="none" stroke="currentColor" stroke-width="1.8"/></svg>PDF는 이 기기 안에서만 처리하고 어디로도 보내지 않습니다. 클로드 같은 AI 서비스를 거치지 않습니다.</p>
       <p class="app-status" id="appStatus"></p>
     </div>
   </header>
@@ -62,6 +62,23 @@
         </div>
         <p class="hint">설정을 바꾸면 이미 변환한 결과에도 바로 반영됩니다.</p>
       </div>
+
+      <div class="block">
+        <h2>문자인식(OCR)</h2>
+        <label class="check"><input type="checkbox" id="optOcr"><span>글자가 없는 쪽(스캔·사진)은 문자인식으로 읽기</span></label>
+        <div class="field-row">
+          <label for="optOcrLang">문서 언어</label>
+          <select id="optOcrLang">
+            <option value="auto">자동 (한국어 우선, 영어가 섞이면 함께)</option>
+            <option value="kor">한국어</option>
+            <option value="kor+eng">한국어 + 영어</option>
+            <option value="eng">영어</option>
+          </select>
+        </div>
+        <p class="hint" id="ocrStatus">문자인식 엔진 상태를 확인하는 중…</p>
+        <button id="ocrGet" class="btn small" type="button" hidden>지금 미리 받기</button>
+        <p class="hint">공개 문자인식 엔진(Tesseract)이 이 기기 안에서 그림 속 글자를 읽습니다. 글자를 잘못 읽을 수 있으니 중요한 내용은 원본과 확인하세요.</p>
+      </div>
     </section>
 
     <section class="panel" aria-labelledby="h-out">
@@ -82,15 +99,19 @@
         <summary>도움말 · 개인정보</summary>
         <dl class="faq">
           <dt>어떻게 작동하나요?</dt>
-          <dd>공개 PDF 엔진(PDF.js)으로 PDF 안에 글자로 저장된 정보를 그대로 꺼냅니다. 모든 처리는 이 기기의 브라우저 안에서 이루어지며, PDF와 결과는 어떤 서버로도 전송되지 않습니다. AI나 문자인식(OCR)을 쓰지 않으므로 글자를 추측하거나 지어내지 않습니다.</dd>
+          <dd>공개 PDF 엔진(PDF.js)으로 PDF 안에 글자로 저장된 정보를 그대로 꺼냅니다. 글자 정보가 없는 쪽(스캔·사진)은 설정에 따라 문자인식으로 읽습니다. 모든 처리는 이 기기의 브라우저 안에서 이루어지며, PDF와 결과는 어떤 서버로도 전송되지 않습니다. 클로드 같은 AI 서비스도 거치지 않습니다.</dd>
+          <dt>문자인식(OCR)은 어떻게 하나요?</dt>
+          <dd>공개 문자인식 엔진 Tesseract가 이 기기 안에서 쪽을 그림으로 그려 글자를 읽습니다. 엔진 안의 글자 인식기는 글자 모양을 미리 학습한 작은 신경망(LSTM)이지만, 인터넷이나 AI 서비스와 통신하지 않습니다. 엔진(약 8 MB)은 처음 한 번 이 앱 주소에서 받아 기기에 보관하므로, 그 뒤에는 인터넷 없이도 작동합니다. 그림을 읽어 추정하는 방식이라 PDF 안의 글자를 꺼낼 때와 달리 틀린 글자가 생길 수 있습니다.</dd>
+          <dt>문자인식 결과를 더 좋게 하려면?</dt>
+          <dd>문서 언어를 맞게 고르세요. 한국어 문서는 ‘한국어’가 가장 정확하고, 영어 약어가 많이 섞이면 ‘한국어 + 영어’가 낫습니다. 스캔은 반듯하고 선명할수록 좋습니다. 거꾸로·옆으로 스캔된 쪽은 방향을 돌려 다시 읽으므로 시간이 더 걸립니다. 두 단으로 편집한 스캔 문서는 읽는 순서가 섞일 수 있고, 손글씨는 거의 읽지 못합니다.</dd>
           <dt>정말 밖으로 안 나가는지 확인하려면?</dt>
           <dd>비행기 모드를 켠 뒤 변환해 보세요. 그래도 작동하면 인터넷을 쓰지 않는다는 뜻입니다. 이 앱 화면에는 다른 인터넷 주소와 통신하지 못하게 막는 보안 정책(CSP)이 걸려 있습니다.</dd>
           <dt>무엇이 기기에 남나요?</dt>
-          <dd>변환 방법 설정과 앱 파일만 남습니다. 넣은 PDF와 변환 결과는 메모리에서만 다루며 앱을 닫으면 사라집니다(직접 저장한 TXT 파일은 남습니다). 암호는 그 자리에서 PDF를 여는 데만 쓰고 저장하지 않습니다.</dd>
+          <dd>변환 설정과 앱 파일(받아 둔 문자인식 엔진 포함)만 남습니다. 넣은 PDF, 문자인식용으로 그린 쪽 그림, 변환 결과는 메모리에서만 다루며 앱을 닫으면 사라집니다(직접 저장한 TXT 파일은 남습니다). 암호는 그 자리에서 PDF를 여는 데만 쓰고 저장하지 않습니다.</dd>
           <dt>글자가 하나도 안 나와요</dt>
-          <dd>스캔하거나 사진으로 만든 PDF는 글자가 그림으로 들어 있어 꺼낼 수 없습니다. 이런 PDF는 문자인식(OCR)이 필요합니다.</dd>
+          <dd>스캔하거나 사진으로 만든 PDF는 글자가 그림으로 들어 있습니다. ‘글자가 없는 쪽은 문자인식으로 읽기’를 켜 두거나, 결과 칸의 ‘문자인식으로 읽기’를 누르세요.</dd>
           <dt>글자가 깨져서 나와요</dt>
-          <dd>PDF를 만들 때 글꼴의 문자 정보가 빠진 경우입니다. 이 앱으로는 고칠 수 없으니, 원본(한글·Word 등)에서 PDF를 다시 만들거나 원본 프로그램에서 텍스트로 저장해 보세요.</dd>
+          <dd>PDF를 만들 때 글꼴의 문자 정보가 빠진 경우입니다. 결과 칸의 ‘모든 쪽을 문자인식으로 다시 읽기’로 그림에서 글자를 읽어 보거나, 원본(한글·Word 등)에서 PDF를 다시 만들어 보세요.</dd>
           <dt>순서가 이상해요</dt>
           <dd>두 단 이상으로 편집한 쪽, 복잡한 표, 글상자가 많은 문서는 읽는 순서가 원본과 다를 수 있습니다. 표의 칸은 탭으로 나눕니다.</dd>
           <dt>문단 이어 붙이기의 띄어쓰기가 틀려요</dt>
@@ -98,7 +119,7 @@
           <dt>다른 앱에서 바로 보내기 (Android)</dt>
           <dd>홈 화면에 설치하면 파일 앱·메신저에서 PDF를 ‘공유 → PDF→TXT’로 보낼 수 있습니다. 이때도 PDF는 이 기기 안에서만 처리됩니다.</dd>
         </dl>
-        <p class="credits">사용한 오픈소스: PDF.js 6.5.438(Apache-2.0)과 딸린 CMap·표준 글꼴 — 라이선스는 <code>LICENSES</code> 폴더에 있습니다.</p>
+        <p class="credits">사용한 오픈소스: PDF.js 6.5.438(Apache-2.0)과 딸린 CMap·표준 글꼴·그림 해독기, tesseract.js 7.0.0(Apache-2.0)과 Tesseract 한국어·영어 학습 데이터(tessdata_best, Apache-2.0) — 라이선스는 <code>LICENSES</code> 폴더에 있습니다.</p>
       </details>
     </section>
   </main>
@@ -120,6 +141,7 @@
 <div class="toast" id="toast" role="status" aria-live="polite" hidden><span id="toastMsg"></span><button id="toastAct" type="button" hidden></button></div>
 
 <script src="textcore.js" defer></script>
+<script src="ocr.js" defer></script>
 <script src="app.js" defer></script>
 </body>
 </html>

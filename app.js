@@ -9,7 +9,8 @@
   var SETTINGS_KEY = 'pdf2txt.settings.v1';
   var INSTALL_KEY = 'pdf2txt.installDismissed';
   var SHARE_CACHE = 'pdf2txt-share';
-  var DEFAULTS = { mode: 'lines', pageMarks: true, forms: true, windows: false };
+  var DEFAULTS = { mode: 'lines', pageMarks: true, forms: true, windows: false, ocr: true, ocrLang: 'auto' };
+  var OCR_LANGS = ['auto', 'kor', 'kor+eng', 'eng'];
   var PREVIEW_CHARS = 20000;
 
   var ICON = {
@@ -39,6 +40,7 @@
   }
   function fmtBytes(n) { return n < 1024 * 1024 ? Math.max(1, Math.round(n / 1024)) + ' KB' : (n / 1024 / 1024).toFixed(1) + ' MB'; }
   function fmtNum(n) { return n.toLocaleString('ko-KR'); }
+  function fmtMB(n) { return (n / 1048576).toFixed(1); }
   function today() {
     var d = new Date();
     return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
@@ -55,7 +57,8 @@
       if (raw) {
         var v = JSON.parse(raw);
         if (v && (v.mode === 'lines' || v.mode === 'paragraphs')) s.mode = v.mode;
-        ['pageMarks', 'forms', 'windows'].forEach(function (k) { if (v && typeof v[k] === 'boolean') s[k] = v[k]; });
+        ['pageMarks', 'forms', 'windows', 'ocr'].forEach(function (k) { if (v && typeof v[k] === 'boolean') s[k] = v[k]; });
+        if (v && OCR_LANGS.indexOf(v.ocrLang) !== -1) s.ocrLang = v.ocrLang;
       }
     } catch (e) { /* 저장소를 못 쓰면 기본값 */ }
     return s;
@@ -103,6 +106,7 @@
       cMapUrl: base + 'cmaps/',
       cMapPacked: true,
       standardFontDataUrl: base + 'standard_fonts/',
+      wasmUrl: base + 'wasm/',      // 스캔 PDF의 JPEG 2000·JBIG2 그림 해독기(문자인식용으로 쪽을 그릴 때)
       useWorkerFetch: false,        // CMap·글꼴 파일은 화면 쪽에서 앱 보관함(서비스 워커)을 거쳐 읽는다
       disableFontFace: true,        // 화면에 그리지 않으므로 글꼴을 등록하지 않는다
       disableWorkerRendering: true,
@@ -183,40 +187,61 @@
     try {
       var job;
       while ((job = state.jobs.find(function (j) { return j.status === 'queued'; }))) {
-        await processJob(job);
+        if (job.pendingOcr && job.pages.length) await processOcrOnly(job);
+        else await processJob(job);
       }
     } finally {
       state.running = false;
       keepAwake(false);
+      if (window.Pdf2TxtOcr) window.Pdf2TxtOcr.stop();   // 문자인식 작업자가 쓰던 메모리를 돌려준다
+      refreshOcrStatus();
       if (state.pendingReload) offerReload();
     }
   }
 
+  /** 취소하면 곧바로 끝나도록, 기다리는 작업을 취소 신호와 겨룬다 */
+  function armCancel(job) {
+    job.cancelWait = new Promise(function (resolve, reject) { job.onCancel = function () { reject({ code: 'cancelled' }); }; });
+    job.cancelWait.catch(function () { /* 처리됨 */ });
+  }
+  function race(job, p) { return Promise.race([p, job.cancelWait]); }
+
+  /** PDF를 연다(암호가 있으면 묻는다). */
+  async function openJobPdf(job, lib) {
+    var bytes = new Uint8Array(await job.file.arrayBuffer());
+    if (!C.looksLikePdf(bytes)) throw { code: 'notpdf' };
+    var task = openPdf(lib, bytes);
+    bytes = null;
+    job.task = task;
+    task.onPassword = function (update, reason) {
+      askPassword(job.name, reason === lib.PasswordResponses.INCORRECT_PASSWORD).then(function (pw) {
+        if (pw === null || job.cancel) {
+          job.pwSkipped = true;
+          task.destroy();
+        } else update(pw);
+      });
+    };
+    var pdf = await task.promise;
+    job.pwSkipped = false;
+    return { task: task, pdf: pdf };
+  }
+
   async function processJob(job) {
     job.status = 'reading';
+    job.phase = 'extract';
     job.pages = [];
     job.done = 0;
-    job.error = '';
+    job.error = job.ocrError = '';
+    job.ocrStopped = false;
     job.cancel = false;
+    armCancel(job);
     renderJob(job);
     var task = null;
     try {
       var lib = await loadPdfjs();
-      var bytes = new Uint8Array(await job.file.arrayBuffer());
-      if (!C.looksLikePdf(bytes)) throw { code: 'notpdf' };
-      task = openPdf(lib, bytes);
-      bytes = null;
-      job.task = task;
-      task.onPassword = function (update, reason) {
-        askPassword(job.name, reason === lib.PasswordResponses.INCORRECT_PASSWORD).then(function (pw) {
-          if (pw === null || job.cancel) {
-            job.pwSkipped = true;
-            task.destroy();
-          } else update(pw);
-        });
-      };
-      var pdf = await task.promise;
-      job.pwSkipped = false;
+      var opened = await openJobPdf(job, lib);
+      task = opened.task;
+      var pdf = opened.pdf;
       job.numPages = pdf.numPages;
       try {
         var perms = await pdf.getPermissions();
@@ -237,6 +262,12 @@
         job.done = i;
         showProgress(job);
       }
+      // 글자가 없는(스캔한) 쪽은 설정에 따라 문자인식으로 읽는다. 실패해도 꺼낸 글자는 그대로 남긴다.
+      if (state.settings.ocr && window.Pdf2TxtOcr) {
+        var targets = [];
+        job.pages.forEach(function (p, k) { if (C.needsOcr(p)) targets.push(k); });
+        if (targets.length) await ocrPages(job, pdf, lib, targets, false);
+      }
       job.diag = C.diagnose(job);
       job.status = 'done';
       compose(job);
@@ -247,6 +278,7 @@
       job.text = '';
     } finally {
       job.task = null;
+      job.phase = '';
       if (task) { try { await task.destroy(); } catch (e) { /* 무시 */ } }
       renderJob(job);
       updateList();
@@ -255,6 +287,123 @@
       var others = state.jobs.filter(function (j) { return j.status === 'queued' || j.status === 'reading'; }).length;
       if (!others) toast(state.jobs.filter(function (j) { return j.status === 'done'; }).length > 1 ? '모든 PDF를 변환했습니다.' : '변환했습니다. ‘TXT 저장’을 눌러 파일로 받으세요.');
     }
+  }
+
+  /**
+   * 정해진 쪽들을 그림으로 그려 문자인식한다.
+   * all=false: 글자가 거의 없는 쪽만, 결과가 원래 글자보다 많을 때 바꾼다. all=true: 문자인식 결과로 바꾼다(깨진 글꼴 PDF용).
+   * 취소하거나 엔진을 못 받으면 여기까지 읽은 결과를 남기고 알린다.
+   */
+  async function ocrPages(job, pdf, lib, targets, all) {
+    var O = window.Pdf2TxtOcr;
+    job.ocrTotal = targets.length;
+    job.ocrDone = 0;
+    job.ocrSub = 0;
+    job.ocrPass = 1;
+    try {
+      var st = await O.status();
+      if (!st.ready) {
+        job.phase = 'ocr-download';
+        job.dl = { done: 0, total: st.missing };
+        renderJob(job);
+        await race(job, O.download(function (d, t) { job.dl = { done: d, total: t }; showProgress(job); }));
+        refreshOcrStatus();
+      }
+      O.resetAuto();
+      job.phase = 'ocr';
+      renderJob(job);
+      for (var k = 0; k < targets.length; k++) {
+        if (job.cancel) throw { code: 'cancelled' };
+        var rec = job.pages[targets[k]];
+        job.ocrSub = 0;
+        job.ocrPass = 1;
+        showProgress(job);
+        var page = await race(job, pdf.getPage(targets[k] + 1));
+        var r;
+        try {
+          r = await race(job, O.readPage(page, lib, state.settings.ocrLang, function (prog, pass, rot) {
+            job.ocrSub = prog;
+            job.ocrPass = pass;
+            job.ocrRot = rot;
+            showProgress(job);
+          }));
+        } finally {
+          job.ocrRot = 0;
+          try { page.cleanup(); } catch (e) { /* 무시 */ }
+        }
+        var lines = C.ocrLines(r.data);
+        rec.ocrTried = true;
+        if (all ? C.pageChars(lines) > 0 : C.preferOcr(rec.lines, lines)) {
+          rec.lines = lines;
+          rec.ocr = { conf: Math.round(r.data.confidence || 0), lang: r.lang, rot: r.rotated || 0 };
+        }
+        job.ocrDone = k + 1;
+        showProgress(job);
+      }
+    } catch (e) {
+      if (job.cancel || (e && e.code === 'cancelled')) {
+        job.ocrStopped = true;
+        job.cancel = false;          // 꺼낸 글자는 살린다
+        O.stop();
+      } else {
+        job.ocrError = describeOcrError(e);
+        O.stop();
+      }
+    }
+  }
+
+  /** 이미 변환한 결과에 문자인식만 더 한다(‘문자인식으로 읽기’ 단추). PDF를 다시 연다. */
+  async function processOcrOnly(job) {
+    var mode = job.pendingOcr;
+    job.pendingOcr = null;
+    job.status = 'reading';
+    job.phase = 'open';
+    job.ocrError = '';
+    job.ocrStopped = false;
+    job.cancel = false;
+    armCancel(job);
+    renderJob(job);
+    var task = null;
+    try {
+      var lib = await loadPdfjs();
+      var opened = await openJobPdf(job, lib);
+      task = opened.task;
+      var targets = [];
+      job.pages.forEach(function (p, k) {
+        if (p.err) return;
+        if (mode === 'all' ? !p.ocr : C.needsOcr(p)) targets.push(k);
+      });
+      if (targets.length) await ocrPages(job, opened.pdf, lib, targets, mode === 'all');
+    } catch (e) {
+      if (job.cancel) { job.ocrStopped = true; job.cancel = false; }
+      else job.ocrError = job.pwSkipped ? '암호를 입력하지 않아 문자인식을 하지 못했습니다.' : describeError(e, job);
+    } finally {
+      job.task = null;
+      job.phase = '';
+      if (task) { try { await task.destroy(); } catch (e) { /* 무시 */ } }
+      job.diag = C.diagnose(job);
+      job.status = 'done';
+      compose(job);
+      renderJob(job);
+      updateList();
+    }
+    if (!job.ocrError && !job.ocrStopped) toast('문자인식을 마쳤습니다.');
+  }
+
+  function queueOcr(job, mode) {
+    if (!job.file) return;
+    job.pendingOcr = mode;
+    job.status = 'queued';
+    renderJob(job);
+    runQueue();
+  }
+
+  function describeOcrError(e) {
+    var msg = String((e && (e.message || e)) || '');
+    if (/HTTP|fetch|network|Failed to fetch|Load failed|오프라인/i.test(msg) || !navigator.onLine) {
+      return '문자인식 엔진을 받지 못해 글자 없는 쪽을 읽지 못했습니다. 인터넷에 연결된 상태에서 ‘문자인식으로 읽기’를 누르세요(처음 한 번만 받으면 됩니다).';
+    }
+    return '문자인식 중 문제가 생겨 일부 쪽을 읽지 못했습니다' + (msg ? ' (' + msg.slice(0, 100) + ')' : '') + '.';
   }
 
   function describeError(e, job) {
@@ -357,7 +506,8 @@
     el.appendChild(head);
 
     if (job.status === 'queued' || job.status === 'reading') {
-      var prog = h('progress', { max: '1', value: job.numPages ? String(job.done / job.numPages) : null });
+      var pv = progressValue(job);
+      var prog = h('progress', { max: '1', value: pv == null ? null : String(pv) });
       var label = h('span', { text: progressText(job) });
       el.appendChild(h('div', { class: 'prog' }, [
         prog, label,
@@ -405,27 +555,73 @@
       acts.push(h('button', { class: 'btn', type: 'button', html: ICON.share + '<span>공유</span>', onclick: function () { share([jobFile(job)]); } }));
     }
     el.appendChild(h('div', { class: 'actions' }, acts));
+    // 문자인식 단추: 글자가 없는 쪽이 남았으면 그 쪽만, 그 밖에는 모든 쪽을 다시 읽는 단추(깨진 글자 등)
+    if (window.Pdf2TxtOcr && job.file) {
+      var d = job.diag || {};
+      var untried = (d.emptyPages || []).filter(function (n) { return job.pages[n - 1] && !job.pages[n - 1].ocrTried; });
+      var ocrActs = [];
+      if (untried.length) {
+        ocrActs.push(h('button', { class: 'btn', type: 'button', text: (untried.length === job.numPages ? '' : '글자 없는 쪽 ') + '문자인식으로 읽기', onclick: function () { queueOcr(job, 'empty'); } }));
+      }
+      var notOcr = job.pages.filter(function (p) { return !p.err && !p.ocr; }).length;
+      if (notOcr && (d.garbled || !untried.length)) {
+        // 글자가 멀쩡한 PDF에서 누르면 정확한 글자를 추정한 글자로 바꾸게 되므로, 쓰임을 단추 이름에 밝힌다
+        ocrActs.push(h('button', { class: 'btn' + (d.garbled ? '' : ' small subtle'), type: 'button', text: d.garbled ? '모든 쪽을 문자인식으로 다시 읽기' : '글자가 이상할 때만: 문자인식으로 다시 읽기', onclick: function () { queueOcr(job, 'all'); } }));
+      }
+      if (ocrActs.length) el.appendChild(h('div', { class: 'actions ocr-acts' }, ocrActs));
+    }
   }
 
   function noteItems(job) {
-    var d = job.diag || { emptyPages: [], errorPages: [], garbled: false };
+    var d = job.diag || { emptyPages: [], errorPages: [], ocrPages: [], lowConfPages: [], garbled: false };
     var out = [];
-    var textPages = job.numPages - d.emptyPages.length - d.errorPages.length;
-    if (job.numPages && textPages <= 0 && !d.errorPages.length) {
-      out.push(h('li', { class: 'warn', text: '꺼낼 글자가 없습니다. 스캔하거나 사진으로 만든 PDF처럼 글자가 그림으로 들어 있는 것으로 보입니다. 이런 PDF는 문자인식(OCR)을 거쳐야 글자를 얻을 수 있습니다.' }));
-    } else if (d.emptyPages.length) {
-      out.push(h('li', { class: 'warn', text: '글자가 없는 쪽: ' + C.pageRanges(d.emptyPages) + '쪽 (그림이나 스캔한 쪽으로 보입니다)' }));
+    var empty = d.emptyPages || [];
+    var tried = empty.filter(function (n) { return job.pages[n - 1] && job.pages[n - 1].ocrTried; });
+    var untried = empty.filter(function (n) { return tried.indexOf(n) === -1; });
+    var ocrPages = d.ocrPages || [];
+    var textPages = job.numPages - empty.length - d.errorPages.length;
+    if (ocrPages.length) {
+      out.push(h('li', { class: 'info', text: '문자인식으로 읽은 쪽: ' + C.pageRanges(ocrPages) + '쪽 (평균 신뢰도 ' + d.ocrConf + '%). 글자를 잘못 읽었을 수 있으니 중요한 내용은 원본과 비교해 확인하세요.' }));
     }
+    if ((d.rotatedPages || []).length) {
+      out.push(h('li', { class: 'info', text: '거꾸로·옆으로 스캔되어 방향을 돌려 읽은 쪽: ' + C.pageRanges(d.rotatedPages) + '쪽' }));
+    }
+    if ((d.lowConfPages || []).length) {
+      out.push(h('li', { class: 'warn', text: '신뢰도가 낮은 쪽: ' + C.pageRanges(d.lowConfPages) + '쪽 — 흐리거나 기울어졌거나 글자가 작은 그림은 결과가 부정확합니다.' }));
+    }
+    if (job.numPages && textPages <= 0 && !d.errorPages.length && !ocrPages.length) {
+      if (tried.length) out.push(h('li', { class: 'warn', text: '문자인식으로도 글자를 찾지 못했습니다. 글자가 아주 작거나 흐리거나, 글자가 없는 그림일 수 있습니다.' }));
+      else out.push(h('li', { class: 'warn', text: '꺼낼 글자가 없습니다. 스캔하거나 사진으로 만든 PDF처럼 글자가 그림으로 들어 있습니다. 아래 ‘문자인식으로 읽기’를 누르면 이 기기 안에서 그림 속 글자를 읽어 냅니다.' }));
+    } else {
+      if (untried.length) out.push(h('li', { class: 'warn', text: '글자가 없는 쪽: ' + C.pageRanges(untried) + '쪽 (그림이나 스캔한 쪽으로 보입니다)' }));
+      if (tried.length) out.push(h('li', { class: 'info', text: '문자인식으로도 글자를 찾지 못한 쪽: ' + C.pageRanges(tried) + '쪽' }));
+    }
+    if (job.ocrError) out.push(h('li', { class: 'bad', text: job.ocrError }));
+    if (job.ocrStopped) out.push(h('li', { class: 'info', text: '문자인식을 중간에 멈췄습니다. 읽은 쪽까지만 담겼습니다.' }));
     if (d.errorPages.length) out.push(h('li', { class: 'bad', text: '읽지 못한 쪽: ' + C.pageRanges(d.errorPages) + '쪽 (파일 일부가 손상된 것 같습니다)' }));
-    if (d.garbled) out.push(h('li', { class: 'warn', text: '일부 글자가 깨졌을 수 있습니다. PDF 안의 글꼴에 문자 정보가 빠진 경우로, 원본과 비교해 확인하세요.' }));
+    if (d.garbled) out.push(h('li', { class: 'warn', text: '일부 글자가 깨졌을 수 있습니다. PDF 안의 글꼴에 문자 정보가 빠진 경우입니다. ‘모든 쪽을 문자인식으로 다시 읽기’로 그림에서 글자를 읽어 볼 수 있습니다.' }));
     if (job.noCopy) out.push(h('li', { class: 'info', text: '작성자가 이 PDF의 글자 복사를 제한해 두었습니다. 저작권과 이용 조건을 지켜 사용하세요.' }));
     return out;
   }
 
   function progressText(job) {
-    if (job.status === 'queued') return '차례를 기다리는 중';
+    if (job.status === 'queued') return job.pendingOcr ? '문자인식 차례를 기다리는 중' : '차례를 기다리는 중';
+    if (job.phase === 'open') return '여는 중…';
+    if (job.phase === 'ocr-download') return '문자인식 엔진 받는 중 ' + fmtMB(job.dl.done) + ' / ' + fmtMB(job.dl.total) + ' MB (처음 한 번만)';
+    if (job.phase === 'ocr') {
+      var n = Math.min(job.ocrDone + 1, job.ocrTotal) + ' / ' + job.ocrTotal + '쪽';
+      if (!job.ocrDone && !job.ocrSub) return '문자인식 준비 중… (' + n + ')';
+      return '문자인식 ' + n + (job.ocrRot ? ' · 방향을 바꿔 다시 읽는 중' : job.ocrPass === 2 ? ' · 영어 섞인 쪽 다시 읽는 중' : '') + ' ' + Math.round(job.ocrSub * 100) + '%';
+    }
     if (!job.numPages) return '여는 중…';
     return fmtNum(job.done) + ' / ' + fmtNum(job.numPages) + '쪽 읽는 중';
+  }
+
+  function progressValue(job) {
+    if (job.status === 'queued' || job.phase === 'open') return null;
+    if (job.phase === 'ocr-download') return job.dl && job.dl.total ? job.dl.done / job.dl.total : null;
+    if (job.phase === 'ocr') return job.ocrTotal ? Math.min(1, (job.ocrDone + job.ocrSub) / job.ocrTotal) : null;
+    return job.numPages ? job.done / job.numPages : null;
   }
 
   var progFrame = 0;
@@ -433,15 +629,25 @@
     if (progFrame) return;
     progFrame = requestAnimationFrame(function () {
       progFrame = 0;
-      if (job.progEl) job.progEl.value = job.numPages ? job.done / job.numPages : 0;
+      if (job.progEl) {
+        var v = progressValue(job);
+        if (v == null) job.progEl.removeAttribute('value'); else job.progEl.value = v;
+      }
       if (job.labelEl) job.labelEl.textContent = progressText(job);
     });
   }
 
   function cancelJob(job) {
     job.cancel = true;
-    if (job.status === 'queued') { job.status = 'cancelled'; job.error = '변환을 취소했습니다.'; renderJob(job); updateList(); }
-    else if (job.task) { try { job.task.destroy(); } catch (e) { /* 무시 */ } }
+    if (job.status === 'queued') {
+      if (job.pendingOcr) { job.pendingOcr = null; job.cancel = false; job.status = 'done'; }
+      else { job.status = 'cancelled'; job.error = '변환을 취소했습니다.'; }
+      renderJob(job);
+      updateList();
+      return;
+    }
+    if (job.onCancel) job.onCancel();
+    if (job.task && (job.phase === 'extract' || job.phase === 'open')) { try { job.task.destroy(); } catch (e) { /* 무시 */ } }
   }
 
   function removeJob(job) {
@@ -488,15 +694,59 @@
       r.checked = r.value === s.mode;
       r.addEventListener('change', function () { if (r.checked) { s.mode = r.value; settingsChanged(); } });
     });
-    [['#optMarks', 'pageMarks'], ['#optForms', 'forms'], ['#optWin', 'windows']].forEach(function (pair) {
+    [['#optMarks', 'pageMarks'], ['#optForms', 'forms'], ['#optWin', 'windows'], ['#optOcr', 'ocr']].forEach(function (pair) {
       var box = $(pair[0]);
       box.checked = !!s[pair[1]];
       box.addEventListener('change', function () { s[pair[1]] = box.checked; settingsChanged(); });
     });
+    var lang = $('#optOcrLang');
+    lang.value = s.ocrLang;
+    lang.addEventListener('change', function () { if (OCR_LANGS.indexOf(lang.value) !== -1) { s.ocrLang = lang.value; saveSettings(); } });
+    $('#ocrGet').addEventListener('click', getOcrEngine);
   }
   function settingsChanged() {
     saveSettings();
     doneJobs().forEach(function (j) { compose(j); renderJob(j); });
+  }
+
+  /* ---------- 문자인식 엔진(미리 받기·상태) ---------- */
+
+  var ocrDownloading = false;
+  async function refreshOcrStatus() {
+    var el = $('#ocrStatus'), btn = $('#ocrGet');
+    if (!el || ocrDownloading) return;
+    if (!window.Pdf2TxtOcr) { el.textContent = '이 브라우저에서는 문자인식을 쓸 수 없습니다.'; btn.hidden = true; return; }
+    try {
+      var st = await window.Pdf2TxtOcr.status();
+      if (st.ready) {
+        el.textContent = '문자인식 엔진: 이 기기에 준비됨 — 인터넷 없이도 쓸 수 있습니다.';
+        btn.hidden = true;
+      } else {
+        el.textContent = '문자인식 엔진: 처음 쓸 때 약 ' + fmtMB(st.missing) + ' MB를 이 앱 주소에서 한 번 받습니다.';
+        btn.hidden = false;
+      }
+    } catch (e) {
+      el.textContent = '문자인식 엔진 상태를 확인하지 못했습니다.';
+      btn.hidden = true;
+    }
+  }
+  async function getOcrEngine() {
+    var el = $('#ocrStatus'), btn = $('#ocrGet');
+    if (ocrDownloading || !window.Pdf2TxtOcr) return;
+    ocrDownloading = true;
+    btn.disabled = true;
+    try {
+      await window.Pdf2TxtOcr.download(function (d, t) {
+        el.textContent = '문자인식 엔진 받는 중 ' + fmtMB(d) + ' / ' + fmtMB(t) + ' MB';
+      });
+      toast('문자인식 엔진을 받았습니다. 이제 인터넷 없이도 쓸 수 있습니다.');
+    } catch (e) {
+      toast('문자인식 엔진을 받지 못했습니다. 인터넷 연결을 확인해 주세요.');
+    } finally {
+      ocrDownloading = false;
+      btn.disabled = false;
+      refreshOcrStatus();
+    }
   }
 
   /* ---------- 넣기 ---------- */
@@ -646,6 +896,7 @@
     bindInput();
     updateList();
     setupPwa();
+    refreshOcrStatus();
     document.addEventListener('visibilitychange', function () {
       if (state.running && document.visibilityState === 'visible') keepAwake(true);
     });

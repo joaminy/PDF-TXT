@@ -28,7 +28,7 @@
     '[①-⑳⑴-⒇㉠-㉭㉮-㉻]',
     '(?:[IVX]{1,4}|[ivx]{1,4})[.)](?=\\s)'
   ].join('|') + ')');
-  var HYPHEN_END = /\p{L}[-‐]$/u;
+  var HYPHEN_END = /\p{L}[-\u2010]$/u;
   var LOWER_START = /^\p{Ll}/u;
   var LINE_SEP = new RegExp('[' + String.fromCharCode(0x2028, 0x2029) + ']', 'g');
   var TAB_SURE = 2.5;    // 글자 크기의 이 배수보다 크게 떨어진 글자는 표의 다른 칸으로 본다
@@ -411,8 +411,8 @@
 
   function joinTo(out, next, km) {
     var last = out.slice(-1), prev = out.slice(-2, -1), first = next.charAt(0);
-    if (last === '­') return out.slice(0, -1) + next;                        // 소프트 하이픈
-    if ((last === '-' || last === '‐') && /\p{L}/u.test(prev) && LOWER_START.test(next)) return out.slice(0, -1) + next; // 영어 낱말 나눔
+    if (last === '\u00AD') return out.slice(0, -1) + next;                        // 소프트 하이픈
+    if ((last === '-' || last === '\u2010') && /\p{L}/u.test(prev) && LOWER_START.test(next)) return out.slice(0, -1) + next; // 영어 낱말 나눔
     if (CJK_NOSPACE.test(last) && CJK_NOSPACE.test(first)) return out + next;
     if (CLOSE_PUNCT.test(next) || OPEN_PUNCT.test(last)) return out + next;
     if (HANGUL.test(first) && /[\p{L}\p{N}]/u.test(last)) {
@@ -439,7 +439,7 @@
     text = text.normalize('NFC')
       .replace(/\r\n?/g, '\n').replace(LINE_SEP, '\n')
       .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '')
-      .replace(/ /g, ' ')
+      .replace(/\u00A0/g, ' ')
       .replace(/ {2,}/g, ' ')
       // PDF 안의 글꼴이 바뀌는 자리에 생긴 틈 때문에 끼어든 띄어쓰기(한글 표기에서 쓰지 않는 자리)를 뺀다
       .replace(/([가-힣]) +([.,!?])(?=[\s"'”’)\]」』]|$)/g, '$1$2')
@@ -467,8 +467,9 @@
       var body = p.err ? '' : pageText(p.lines, opts.mode, km);
       if (opts.forms && p.annots && p.annots.length) body += (body ? '\n\n' : '') + '[입력란·글상자]\n' + p.annots.join('\n');
       if (opts.pageMarks && total > 1) {
-        var note = p.err ? '(이 쪽은 읽지 못했습니다)' : '(글자 없음 — 그림이나 스캔한 쪽)';
-        parts.push('===== ' + (i + 1) + ' / ' + total + '쪽 =====\n' + (body || note));
+        var note = p.err ? '(이 쪽은 읽지 못했습니다)'
+          : p.ocrTried ? '(글자 없음 — 문자인식으로도 글자를 찾지 못한 쪽)' : '(글자 없음 — 그림이나 스캔한 쪽)';
+        parts.push('===== ' + (i + 1) + ' / ' + total + '쪽' + (p.ocr ? ' (문자인식)' : '') + ' =====\n' + (body || note));
       } else if (body) parts.push(body);
     }
     return finalize(parts.join('\n\n'));
@@ -532,23 +533,67 @@
   /* ---------- 6. 진단 ---------- */
 
   function diagnose(doc) {
-    var empty = [], errs = [], chars = 0, odd = 0, latin1 = 0, letters = 0;
+    var empty = [], errs = [], ocr = [], lowConf = [], rotated = [], confSum = 0, chars = 0, odd = 0, latin1 = 0, letters = 0;
     doc.pages.forEach(function (p, i) {
       if (p.err) { errs.push(i + 1); return; }
       var compact = p.lines.map(function (l) { return l.t; }).join('').replace(/\s+/g, '');
       if (!compact && !(p.annots && p.annots.length)) empty.push(i + 1);
+      if (p.ocr) {
+        ocr.push(i + 1);
+        confSum += p.ocr.conf;
+        if (p.ocr.conf < 60) lowConf.push(i + 1);
+        if (p.ocr.rot) rotated.push(i + 1);
+        return;                                           // 문자인식 결과는 글꼴 깨짐 검사에서 뺀다
+      }
       chars += compact.length;
-      odd += (compact.match(/[-�]/g) || []).length;
+      odd += (compact.match(/[\uE000-\uF8FF\uFFFD]/g) || []).length;
       latin1 += (compact.match(/[À-ÿ]/g) || []).length;
       letters += (compact.match(/\p{L}/gu) || []).length;
     });
     return {
       emptyPages: empty,
       errorPages: errs,
+      ocrPages: ocr,
+      ocrConf: ocr.length ? Math.round(confSum / ocr.length) : null,
+      lowConfPages: lowConf,
+      rotatedPages: rotated,
       chars: chars,
       garbled: chars > 0 && (odd / chars > 0.02 || (letters > 50 && latin1 / letters > 0.3))
     };
   }
+
+  /* ---------- 6-1. 문자인식(OCR) 결과 ---------- */
+
+  function pageChars(lines) { return lines.map(function (l) { return l.t; }).join('').replace(/\s+/g, '').length; }
+
+  /** 글자가 거의 없는 쪽(10자 미만)은 스캔한 쪽일 수 있어 문자인식 대상으로 본다 */
+  function needsOcr(p) { return !p.err && !p.ocr && pageChars(p.lines) < 10; }
+
+  /**
+   * Tesseract 결과(blocks → paragraphs → lines)를 보관용 줄 목록으로 바꾼다.
+   * 문단의 첫 줄은 앞에 빈 줄(b), 문단 안의 다음 줄은 ‘문단으로 이어 붙이기’ 대상(m).
+   */
+  function ocrLines(data) {
+    var out = [];
+    // 쪽 전체 신뢰도가 아주 낮으면(글자 없는 사진·무늬 쪽 등) 꽤 믿을 만한 줄만 남겨, 엉뚱한 글자가 섞이지 않게 한다
+    var minConf = data && typeof data.confidence === 'number' && data.confidence < 50 ? 60 : 0;
+    ((data && data.blocks) || []).forEach(function (blk) {
+      (blk.paragraphs || []).forEach(function (par) {
+        var first = true;
+        (par.lines || []).forEach(function (ln) {
+          var t = String(ln.text || '').replace(/\s+/g, ' ').trim();
+          if (!t || (ln.confidence || 0) < minConf) return;
+          if ((ln.confidence || 0) < 30 && !/[\p{L}\p{N}]{2}/u.test(t)) return;   // 그림 테두리·얼룩에서 나온 잡음
+          out.push({ t: t, b: out.length > 0 && first, m: !first });
+          first = false;
+        });
+      });
+    });
+    return out;
+  }
+
+  /** 문자인식 결과가 원래 꺼낸 글자보다 확실히 많을 때만 바꾼다(쪽 번호만 글자로 찍힌 스캔 쪽 등) */
+  function preferOcr(oldLines, newLines) { return pageChars(newLines) > pageChars(oldLines) + 10; }
 
   /** [1,2,3,5,8,9] → "1–3, 5, 8–9" */
   function pageRanges(nums, max) {
@@ -663,6 +708,10 @@
     docText: docText,
     annotationTexts: annotationTexts,
     diagnose: diagnose,
+    needsOcr: needsOcr,
+    ocrLines: ocrLines,
+    preferOcr: preferOcr,
+    pageChars: pageChars,
     pageRanges: pageRanges,
     countChars: countChars,
     encodeTxt: encodeTxt,

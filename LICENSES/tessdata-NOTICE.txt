@@ -1,0 +1,4 @@
+vendor/tesseract/lang/kor.traineddata.gz, eng.traineddata.gz
+Source: tesseract-ocr/tessdata_best (Apache License 2.0), integer-converted and packaged by
+@tesseract.js-data/kor and @tesseract.js-data/eng 1.0.0 (npm, MIT license for the packaging).
+https://github.com/tesseract-ocr/tessdata_best  https://github.com/naptha/tessdata

@@ -3,6 +3,10 @@
   "private": true,
   "description": "PDF → TXT 앱을 묶을 때만 쓰는 도구(앱 실행에는 필요 없음)",
   "dependencies": {
-    "pdfjs-dist": "6.5.438"
+    "pdfjs-dist": "6.5.438",
+    "tesseract.js": "7.0.0",
+    "tesseract.js-core": "7.0.0",
+    "@tesseract.js-data/kor": "1.0.0",
+    "@tesseract.js-data/eng": "1.0.0"
   }
 }
