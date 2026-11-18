@@ -1,0 +1,129 @@
+/* PDF → TXT — 오프라인용 서비스 워커.
+   앱 파일을 기기에 보관해 인터넷 없이도 열리게 한다. 다른 주소로는 어떤 요청도 보내지 않는다.
+   사용자의 PDF는 이 워커를 거치지 않는다(파일은 화면에서 바로 메모리로 읽는다).
+   예외: Android ‘공유 → PDF→TXT’로 받은 PDF는 앱이 열릴 때까지 기기 안 임시 보관함에 잠깐 두고, 앱이 꺼내는 즉시 지운다. */
+'use strict';
+const VERSION = '__VERSION__';
+const PREFIX = 'pdf2txt-app-';
+const CACHE = PREFIX + VERSION;
+const SHARE_CACHE = 'pdf2txt-share';
+const FILES = __FILES__;
+const HASH = new Map(FILES.map(([p, h]) => [new URL(p, self.location.href).pathname, h]));
+
+async function sha16(buf) {
+  const d = new Uint8Array(await crypto.subtle.digest('SHA-256', buf));
+  let s = '';
+  for (let i = 0; i < 8; i++) s += d[i].toString(16).padStart(2, '0');
+  return s;
+}
+
+// 새 버전 설치: 내용이 같은 파일은 기기에 있던 것을 옮기고, 바뀐 파일만 받는다.
+// 받은 파일의 내용(해시)도 확인해, 서버에 아직 옛 파일이 남아 있으면 설치를 미루고 다음에 다시 시도한다.
+self.addEventListener('install', (event) => {
+  event.waitUntil((async () => {
+    const cache = await caches.open(CACHE);
+    const oldNames = (await caches.keys()).filter((k) => k.startsWith(PREFIX) && k !== CACHE);
+    const olds = await Promise.all(oldNames.map((k) => caches.open(k)));
+    let next = 0;
+    async function worker() {
+      while (next < FILES.length) {
+        const [path, hash] = FILES[next++];
+        const have = await cache.match(path);
+        if (have && await sha16(await have.arrayBuffer()) === hash) continue;   // 지난번에 받다 끊긴 경우 이어 받기
+        let reused = false;
+        for (const oc of olds) {
+          const r = await oc.match(path);
+          if (!r) continue;
+          const buf = await r.arrayBuffer();
+          if (await sha16(buf) === hash) {
+            await cache.put(path, new Response(buf, { headers: r.headers }));
+            reused = true;
+            break;
+          }
+        }
+        if (reused) continue;
+        const res = await fetch(new Request(path, { cache: 'reload' }));
+        if (!res.ok) throw new Error('HTTP ' + res.status + ' ' + path);
+        const buf = await res.clone().arrayBuffer();
+        if (await sha16(buf) !== hash) throw new Error('아직 옛 파일: ' + path);
+        await cache.put(path, res);
+      }
+    }
+    await Promise.all(Array.from({ length: 6 }, worker));
+    await self.skipWaiting();
+  })());
+});
+
+// 보관함이 비었을 때(같은 주소의 다른 앱이나 기기가 정리한 경우) 인터넷이 되면 이 버전의 파일로 다시 채운다.
+let healing = null;
+function heal() {
+  if (!healing) {
+    healing = (async () => {
+      const cache = await caches.open(CACHE);
+      for (const [path, hash] of FILES) {
+        if (await cache.match(path)) continue;
+        let res;
+        try { res = await fetch(new Request(path, { cache: 'reload' })); } catch (e) { return; }
+        if (!res.ok) continue;
+        const buf = await res.arrayBuffer();
+        if (await sha16(buf) === hash) await cache.put(path, new Response(buf, { headers: res.headers }));
+      }
+    })().catch(() => {}).finally(() => { healing = null; });
+  }
+  return healing;
+}
+
+self.addEventListener('activate', (event) => {
+  event.waitUntil((async () => {
+    // 이 앱의 옛 버전 보관함만 지운다(같은 주소의 다른 앱 보관함은 건드리지 않는다)
+    const keys = await caches.keys();
+    await Promise.all(keys.filter((k) => k.startsWith(PREFIX) && k !== CACHE).map((k) => caches.delete(k)));
+    await self.clients.claim();
+  })());
+});
+
+self.addEventListener('fetch', (event) => {
+  const req = event.request;
+  const url = new URL(req.url);
+  if (url.origin !== self.location.origin) return;
+  if (req.method === 'POST' && url.pathname.endsWith('/share-target')) {
+    event.respondWith(receiveShare(req));
+    return;
+  }
+  if (req.method !== 'GET') return;
+  event.respondWith((async () => {
+    const cache = await caches.open(CACHE);
+    const hit = await cache.match(req, { ignoreSearch: true });
+    if (hit) return hit;
+    if (req.mode === 'navigate') {
+      const page = await cache.match('./index.html');
+      if (page) return page;
+    }
+    try {
+      const res = await fetch(req);
+      if (res.ok && HASH.has(url.pathname)) {
+        try { event.waitUntil(heal()); } catch (e) { heal(); }
+      }
+      return res;
+    } catch (e) {
+      return new Response('오프라인 상태입니다.', { status: 503, headers: { 'Content-Type': 'text/plain; charset=utf-8' } });
+    }
+  })());
+});
+
+// 다른 앱에서 ‘공유 → PDF→TXT’로 보낸 PDF를 기기 안 임시 보관함에 넣고 앱을 연다 (Android)
+async function receiveShare(req) {
+  try {
+    const form = await req.formData();
+    const files = form.getAll('pdf').filter((f) => f && typeof f === 'object' && f.size > 0);
+    const cache = await caches.open(SHARE_CACHE);
+    let i = 0;
+    for (const f of files) {
+      await cache.put(
+        new Request('./__shared__/' + Date.now() + '-' + (i++)),
+        new Response(f, { headers: { 'Content-Type': 'application/pdf', 'X-Name': encodeURIComponent(f.name || 'shared.pdf') } })
+      );
+    }
+  } catch (e) { /* 받지 못하면 그냥 앱을 연다 */ }
+  return Response.redirect(new URL('./?shared=1', self.registration.scope).href, 303);
+}
